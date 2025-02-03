@@ -16,6 +16,8 @@ from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
 from viam.utils import SensorReading, struct_to_dict
 from viam.logging import getLogger
+from viam.services.vision.vision import Vision
+from viam.components.camera.camera import Camera
 
 logger = getLogger(__name__)
 
@@ -46,9 +48,6 @@ class ReportGenerator(Sensor, EasyResource):
         # References to kioskCamera and pizzaTracking
         self.kiosk_camera_name = None
         self.pizza_tracking_name = None
-        # If you’re retrieving actual dependencies, you’ll store them here, e.g.:
-        # self.kiosk_camera = None
-        # self.pizza_tracking_service = None
 
     @classmethod
     def new(
@@ -63,17 +62,17 @@ class ReportGenerator(Sensor, EasyResource):
         # Extract config attributes
         attributes = struct_to_dict(config.attributes)
 
-        sensor.kiosk_camera_name = attributes.get("kioskFeed")
+        sensor.kiosk_camera_name = attributes.get("camera_name")
         if not sensor.kiosk_camera_name:
-            raise Exception("No kioskCamera (kioskFeed) found in config")
+            raise Exception("No camera_name found in config")
 
-        sensor.pizza_tracking_name = attributes.get("myPizzaTracker")
+        sensor.pizza_tracking_name = attributes.get("tracker_name")
         if not sensor.pizza_tracking_name:
-            raise Exception("No pizzaTracking (myPizzaTracker) found in config")
+            raise Exception("No tracker_name found in config")
 
         # Optionally, if these are actual Viam resources, you can fetch them here:
-        # sensor.kiosk_camera = dependencies.get(ResourceName(...))
-        # sensor.pizza_tracking_service = dependencies.get(ResourceName(...))
+        sensor.kiosk_camera = dependencies.get(ResourceName(sensor.kiosk_camera_name))
+        sensor.pizza_tracking_service = dependencies.get(ResourceName(sensor.pizza_tracking_name))
 
         # Start the background thread
         sensor.running = True
@@ -90,14 +89,14 @@ class ReportGenerator(Sensor, EasyResource):
         deps = []
         attributes = struct_to_dict(config.attributes)
 
-        kiosk_camera = attributes.get("kioskFeed")
+        kiosk_camera = attributes.get("camera_name")
         if not kiosk_camera:
-            raise Exception("No kioskCamera found in config")
+            raise Exception("No camera_name found in config")
         deps.append(str(kiosk_camera))
 
-        pizza_tracking = attributes.get("myPizzaTracker")
+        pizza_tracking = attributes.get("tracker_name")
         if not pizza_tracking:
-            raise Exception("No pizzaTracking found in config")
+            raise Exception("No tracker_name found in config")
         deps.append(str(pizza_tracking))
 
         return deps
@@ -213,12 +212,20 @@ class ReportGenerator(Sensor, EasyResource):
             logger.error(f"Error writing JSON file: {e}")
 
     def _rotate_file(self):
-        """Delete the old file, then clear our in-memory data."""
+        """Move the old file to ~/.viam/capture and clear our in-memory data."""
+        capture_dir = os.path.expanduser("~/.viam/capture")
+        if not os.path.exists(capture_dir):
+            logger.error(f"No capture directory: {capture_dir}")
+            # Optionally clear in-memory data for a fresh start each day
+            self.pizza_data = {}
+            return
+        
         if os.path.exists(self.current_filepath):
-            os.remove(self.current_filepath)
-            logger.info(f"Deleted old file: {self.current_filepath}")
+            new_path = os.path.join(capture_dir, os.path.basename(self.current_filepath))
+            os.rename(self.current_filepath, new_path)
+            logger.info(f"Moved {self.current_filepath} to {new_path}")
 
-        # Optionally clear in-memory data for a fresh day
+        # Optionally clear in-memory data for a fresh start each day
         self.pizza_data = {}
 
     def _get_daily_filepath(self, date_str: str) -> str:
