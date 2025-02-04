@@ -1,0 +1,12 @@
+{
+  "module_name": "display-tracking",
+  "namespace": "viam-soleng",
+  "language": "python",
+  "resource_type": "component",
+  "resource_subtype": "sensor",
+  "model_name": "report-generator",
+  "enable_cloud_build": true,
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2025-02-03T14:15:42.017581Z"
+}
