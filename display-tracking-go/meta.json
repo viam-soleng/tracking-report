@@ -1,0 +1,24 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "viam-soleng:display-tracking",
+  "visibility": "public",
+  "url": "",
+  "description": "Modular sensor component: report-generator",
+  "models": [
+    {
+      "api": "rdk:component:sensor",
+      "model": "viam-soleng:display-tracking:report-generator"
+    }
+  ],
+  "entrypoint": "bin/display-tracking",
+  "first_run": "",
+  "build": {
+    "build": "make module.tar.gz",
+    "setup": "make setup",
+    "path": "bin/module.tar.gz",
+    "arch": [
+      "linux/amd64",
+      "linux/arm64"
+    ]
+  }
+}
