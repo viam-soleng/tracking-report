@@ -10,15 +10,16 @@
       "model": "viam-soleng:display-tracking:report-generator"
     }
   ],
-  "entrypoint": "dist/main",
+  "entrypoint": "bin/display-tracking",
   "first_run": "",
   "build": {
-    "build": "./build.sh",
-    "setup": "./setup.sh",
-    "path": "dist/archive.tar.gz",
+    "build": "make module.tar.gz",
+    "setup": "make setup",
+    "path": "bin/module.tar.gz",
     "arch": [
       "linux/amd64",
-      "linux/arm64"
+      "linux/arm64",
+      "darwin/arm64"
     ]
   }
 }
