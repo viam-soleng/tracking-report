@@ -110,7 +110,7 @@ func newDisplayTrackingReportGenerator(ctx context.Context, deps resource.Depend
 	}
 	dataSyncDir := conf.DataSyncDir
 	if dataSyncDir == "" {
-		dataSyncDir = "~/.viam/data/sync"
+		dataSyncDir = "/root/.viam/capture"
 	}
 	interval := conf.Interval
 	if interval == 0 {
@@ -286,10 +286,7 @@ func (s *displayTrackingReportGenerator) writeDetectionsToFile(detections []Trac
 
 // newTrackedObjectInfoFromDetection takes a detection string in the format:
 // "<detection class>_<detection id>_<YYYYMMDD>_<HHMMSS>"
-// and converts it into a TrackedObjectInfo struct. Both FirstSeen and LastSeen
-// are set to the parsed timestamp.
-
-// TODO Correctly parse the date time from the tracked object. the returned object is returning age and first / last seen but just needs to return the ID and the time it was seen. .
+// and converts it into a TrackedObjectInfo struct.
 
 func newTrackedObjectInfoFromDetection(detectionStr string) (TrackedObjectInfo, error) {
 	// Split the detection string
@@ -339,18 +336,25 @@ func newTrackedObjectInfoFromDetection(detectionStr string) (TrackedObjectInfo, 
 	}, nil
 }
 
-// rotateFile moves the current daily file to s.dataSyncDir
+// rotateFile moves the current daily file to s.dataSyncDir, creating the directory if needed.
 func (s *displayTrackingReportGenerator) rotateFile() error {
 	if _, err := os.Stat(s.currentPath); os.IsNotExist(err) {
 		// If file doesn't exist, nothing to rotate
 		return nil
 	}
+
+	// Ensure the target directory exists
+	if err := os.MkdirAll(s.dataSyncDir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", s.dataSyncDir, err)
+	}
+
 	baseName := filepath.Base(s.currentPath)
 	newPath := filepath.Join(s.dataSyncDir, baseName)
 
 	if err := os.Rename(s.currentPath, newPath); err != nil {
-		return err
+		return fmt.Errorf("failed to rename file from %s to %s: %w", s.currentPath, newPath, err)
 	}
+
 	s.logger.Infof("Rotated file from %s to %s", s.currentPath, newPath)
 	return nil
 }
