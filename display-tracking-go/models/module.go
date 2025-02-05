@@ -5,15 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
+	"go.viam.com/rdk/services/vision"
 	"go.viam.com/utils/rpc"
 )
 
@@ -34,8 +35,11 @@ func init() {
 
 // Config holds any config parameters we need.
 type Config struct {
-	TrackerName string `json:"tracker_name"`
-	CameraName  string `json:"camera_name"`
+	TrackerName      string `json:"tracker_name"`
+	CameraName       string `json:"camera_name"`
+	TemporaryDataDir string `json:"temporary_data_dir,omitempty"` // optional attribute
+	DataSyncDir      string `json:"data_sync_dir,omitempty"`      // optional attribute
+	Interval         int    `json:"interval,omitempty"`           // optional attribute
 }
 
 // Validate ensures all parts of the config are valid and returns implicit dependencies.
@@ -52,11 +56,15 @@ func (cfg *Config) Validate(path string) ([]string, error) {
 	return deps, nil
 }
 
-// We'll store minimal info about each detection or "pizza" in this example.
-type PizzaInfo struct {
-	FirstSeen int64  `json:"first_seen"`
-	LastSeen  int64  `json:"last_seen"`
-	ID        string `json:"id,omitempty`
+// We'll store minimal info about each detection or "trackedObject" in this example.
+type TrackedObjectInfo struct {
+	FirstSeenDateTime string `json:"first_seen_date_time"`
+	FirstSeenUnix     int64  `json:"first_seen_unix"`
+	LastSeenDateTime  string `json:"last_seen_date_time"`
+	LastSeenUnix      int64  `json:"last_seen_unix"`
+	Age               int64  `json:"age,omitempty"`
+	ID                string `json:"id,omitempty`
+	Label             string `json:"label,omitempty`
 }
 
 // displayTrackingReportGenerator is our sensor implementation.
@@ -70,12 +78,17 @@ type displayTrackingReportGenerator struct {
 	cancelFunc func()
 
 	// We'll store an in-memory map of detections
-	pizzaData map[string]PizzaInfo
+	trackedObjectData map[string]TrackedObjectInfo
 
 	// For daily file management:
 	currentDate string // e.g. "2025-02-03"
-	currentPath string // e.g. "/data/daily_json/2025-02-03-pizzas.json"
+	currentPath string // e.g. "/data/daily_json/2025-02-03-tracked-objects.json"
 	dataSyncDir string // e.g. "/data/sync"
+	tempDataDir string // e.g. "/data/json_daily_report" (new field)
+	interval    int    // e.g. "/data/json_daily_report" (new field)
+
+	// Tracker to call detections against
+	tracker vision.Service
 
 	// We'll use a mutex to protect file writes
 	fileLock sync.Mutex
@@ -90,21 +103,38 @@ func newDisplayTrackingReportGenerator(ctx context.Context, deps resource.Depend
 
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
+	// Use defaults if not provided in the config.
+	tempDataDir := conf.TemporaryDataDir
+	if tempDataDir == "" {
+		tempDataDir = "/data/json_daily_report"
+	}
+	dataSyncDir := conf.DataSyncDir
+	if dataSyncDir == "" {
+		dataSyncDir = "~/.viam/data/sync"
+	}
+	interval := conf.Interval
+	if interval == 0 {
+		interval = 60
+	}
+
+	tracker, _ := vision.FromDependencies(deps, conf.TrackerName)
+
 	// Initialize the sensor struct
 	s := &displayTrackingReportGenerator{
-		name:       rawConf.ResourceName(),
-		logger:     logger,
-		cfg:        conf,
-		cancelCtx:  cancelCtx,
-		cancelFunc: cancelFunc,
-		pizzaData:  make(map[string]PizzaInfo),
-
-		// For daily rotation:
-		currentDate: time.Now().Format("2006-01-02"),
-		dataSyncDir: "~/.viam/data/sync",
+		name:              rawConf.ResourceName(),
+		logger:            logger,
+		cfg:               conf,
+		cancelCtx:         cancelCtx,
+		cancelFunc:        cancelFunc,
+		trackedObjectData: make(map[string]TrackedObjectInfo),
+		currentDate:       time.Now().Format("2006-01-02"),
+		dataSyncDir:       dataSyncDir,
+		tempDataDir:       tempDataDir,
+		interval:          interval,
+		tracker:           tracker,
 	}
 	// Generate today's file path
-	s.currentPath = s.dailyFilePath(s.currentDate)
+	s.currentPath = s.dailyFilePath(s.currentDate, s.tempDataDir)
 
 	// Start our background goroutine
 	go s.dataCollectionLoop()
@@ -114,7 +144,7 @@ func newDisplayTrackingReportGenerator(ctx context.Context, deps resource.Depend
 
 // dataCollectionLoop runs periodically to collect detections & write them to a daily file.
 func (s *displayTrackingReportGenerator) dataCollectionLoop() {
-	ticker := time.NewTicker(60 * time.Second) // collect every 60 seconds
+	ticker := time.NewTicker(time.Duration(s.interval) * time.Second) // collect every 60 seconds
 	defer ticker.Stop()
 
 	s.logger.Info("Starting data collection loop.")
@@ -140,7 +170,7 @@ func (s *displayTrackingReportGenerator) dataCollectionLoop() {
 
 				// Update to new day
 				s.currentDate = nowDay
-				s.currentPath = s.dailyFilePath(nowDay)
+				s.currentPath = s.dailyFilePath(s.currentDate, s.tempDataDir)
 			}
 
 			// 2) Get new detections (this is a placeholder function below)
@@ -158,9 +188,6 @@ func (s *displayTrackingReportGenerator) dataCollectionLoop() {
 				if err != nil {
 					s.logger.Errorw("failed to write detections to file", "error", err)
 				}
-
-				// Also update our in-memory map (optional)
-				s.updatePizzaData(detections)
 			}
 
 		}
@@ -168,58 +195,148 @@ func (s *displayTrackingReportGenerator) dataCollectionLoop() {
 }
 
 // getDetections simulates calling your vision service with camera name
-func (s *displayTrackingReportGenerator) getDetections() ([]PizzaInfo, error) {
-	// In real code, you'd do something like:
-	// detections, err := yourVisionService.GetDetectionsFromCamera(s.cfg.CameraName)
-	// if err != nil { return nil, err }
-
-	// For demo, let's pretend we found one detection
-	now := time.Now().Unix()
-	demo := []PizzaInfo{
-		{
-			ID:        "pizza_123",
-			FirstSeen: now,
-			LastSeen:  now,
-		},
+func (s *displayTrackingReportGenerator) getDetections() ([]TrackedObjectInfo, error) {
+	// Call the vision service to get raw detections as strings.
+	// We assume that each string is formatted like "oven_0_20250204_150602".
+	s.logger.Info("Getting detections from camera.")
+	// s.logger.Info(fmt.Sprintf("Tracker: %v", s.tracker))
+	// s.logger.Info(fmt.Sprintf("Camera Name: %v", s.cfg.CameraName))
+	rawDetections, err := s.tracker.DetectionsFromCamera(s.cancelCtx, s.cfg.CameraName, map[string]interface{}{})
+	if err != nil {
+		return nil, err
 	}
-	return demo, nil
+
+	detections := make([]TrackedObjectInfo, 0, len(rawDetections))
+	for _, detection := range rawDetections {
+		class_name := detection.Label()
+		parsed, err := newTrackedObjectInfoFromDetection(class_name)
+		if err != nil {
+			s.logger.Errorw("failed to parse detection", "detection", class_name, "error", err)
+			continue
+		}
+
+		detections = append(detections, parsed)
+	}
+
+	return detections, nil
 }
 
 // writeDetectionsToFile opens the current daily file and appends JSON lines
-func (s *displayTrackingReportGenerator) writeDetectionsToFile(detections []PizzaInfo) error {
-	// Create or append
-	f, err := os.OpenFile(s.currentPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+func (s *displayTrackingReportGenerator) writeDetectionsToFile(detections []TrackedObjectInfo) error {
+	// Check if the file exists and read its contents if it does.
+	var existingDetections map[string][]TrackedObjectInfo
+	if _, err := os.Stat(s.currentPath); err == nil {
+		data, err := os.ReadFile(s.currentPath)
+		if err != nil {
+			return err
+		}
+		if len(data) > 0 {
+			if err := json.Unmarshal(data, &existingDetections); err != nil {
+				return err
+			}
+		}
+	} else {
+		// Initialize the map if the file doesn't exist yet
+		existingDetections = make(map[string][]TrackedObjectInfo)
+	}
+
+	// Process each incoming detection and group by class (Label)
+	for _, newDetection := range detections {
+		// Group by class (Label)
+		classLabel := newDetection.Label
+
+		// Check if the class label already exists in the map
+		if classDetections, exists := existingDetections[classLabel]; exists {
+			// Update or add the detection if its ID already exists
+			found := false
+			for i, existing := range classDetections {
+				if existing.ID == newDetection.ID {
+					// Update the LastSeen field and Age
+					existingDetections[classLabel][i].LastSeenUnix = newDetection.LastSeenUnix
+					existingDetections[classLabel][i].LastSeenDateTime = newDetection.LastSeenDateTime
+					existingDetections[classLabel][i].Age = newDetection.LastSeenUnix - existingDetections[classLabel][i].FirstSeenUnix
+					found = true
+					break
+				}
+			}
+			// If the detection ID was not found, append it
+			if !found {
+				existingDetections[classLabel] = append(existingDetections[classLabel], newDetection)
+			}
+		} else {
+			// If the class label doesn't exist, create a new list and add the detection
+			existingDetections[classLabel] = []TrackedObjectInfo{newDetection}
+		}
+	}
+
+	// Marshal the updated map back to JSON
+	out, err := json.MarshalIndent(existingDetections, "", "  ")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
-	enc := json.NewEncoder(f)
-	for _, d := range detections {
-		if err := enc.Encode(d); err != nil {
-			return err
-		}
+	// Overwrite the file with the updated JSON
+	if err := os.WriteFile(s.currentPath, out, 0600); err != nil {
+		return err
 	}
-	s.logger.Infof("Appended %d detections to %s", len(detections), s.currentPath)
+
+	s.logger.Infof("Updated detections in %s", s.currentPath)
 	return nil
 }
 
-// updatePizzaData merges new detections into our in-memory map
-func (s *displayTrackingReportGenerator) updatePizzaData(detections []PizzaInfo) {
-	now := time.Now().Unix()
-	for _, d := range detections {
-		existing, ok := s.pizzaData[d.ID]
-		if !ok {
-			s.pizzaData[d.ID] = PizzaInfo{
-				FirstSeen: d.FirstSeen,
-				LastSeen:  d.LastSeen,
-				ID:        d.ID,
-			}
-		} else {
-			existing.LastSeen = now
-			s.pizzaData[d.ID] = existing
-		}
+// newTrackedObjectInfoFromDetection takes a detection string in the format:
+// "<detection class>_<detection id>_<YYYYMMDD>_<HHMMSS>"
+// and converts it into a TrackedObjectInfo struct. Both FirstSeen and LastSeen
+// are set to the parsed timestamp.
+
+// TODO Correctly parse the date time from the tracked object. the returned object is returning age and first / last seen but just needs to return the ID and the time it was seen. .
+
+func newTrackedObjectInfoFromDetection(detectionStr string) (TrackedObjectInfo, error) {
+	// Split the detection string
+	parts := strings.Split(detectionStr, "_")
+	if len(parts) != 4 {
+		return TrackedObjectInfo{}, fmt.Errorf("unexpected detection format: %s", detectionStr)
 	}
+
+	// Extract class, ID, date, and time from the parts
+	detectionClass := parts[0]
+	detectionID := parts[1]
+	datePart := parts[2] // e.g., "20250204"
+	timePart := parts[3] // e.g., "193808" (6 digits)
+
+	// Combine date and time to form the complete timestamp
+	dateTimeStr := datePart + timePart // e.g., "202502041938081"
+
+	// Parse the combined dateTime string into a time.Time object
+	t, err := time.ParseInLocation("20060102150405", dateTimeStr, time.Local)
+	if err != nil {
+		return TrackedObjectInfo{}, fmt.Errorf("failed to parse datetime %s: %w", dateTimeStr, err)
+	}
+
+	// Format FirstSeen in Unix timestamp (seconds since epoch)
+	firstSeenUnix := t.Unix()
+
+	// Get the current time for LastSeen
+	lastSeenUnix := time.Now().Unix()
+
+	// Calculate the Age (difference between FirstSeen and LastSeen in seconds)
+	age := lastSeenUnix - firstSeenUnix
+
+	// Convert FirstSeen and LastSeen to human-readable format
+	firstSeenDateTime := t.Format("2006-01-02 15:04:05 -0700 MST") // YYYY-MM-DD HH:MM:SS ±HHMM TZ
+	fmt.Println("Date time:", firstSeenDateTime)
+	lastSeenDateTime := time.Now().Format("2006-01-02 15:04:05 -0700 MST") // Current time in human-readable format with timezone
+
+	// Return the tracked object with all parsed values
+	return TrackedObjectInfo{
+		FirstSeenDateTime: firstSeenDateTime,
+		FirstSeenUnix:     firstSeenUnix,
+		LastSeenDateTime:  lastSeenDateTime,
+		LastSeenUnix:      lastSeenUnix,
+		Age:               age,
+		ID:                detectionID,
+		Label:             detectionClass,
+	}, nil
 }
 
 // rotateFile moves the current daily file to s.dataSyncDir
@@ -238,11 +355,12 @@ func (s *displayTrackingReportGenerator) rotateFile() error {
 	return nil
 }
 
-// dailyFilePath returns something like /data/daily_json/2025-02-03-pizzas.json
-func (s *displayTrackingReportGenerator) dailyFilePath(dateStr string) string {
-	dir := "/data/daily_json"
-	_ = os.MkdirAll(dir, 0755) // ensure directory exists
-	return filepath.Join(dir, fmt.Sprintf("%s-pizzas.json", dateStr))
+// dailyFilePath returns something like "/data/json_daily_report/2025-02-03-tracked-objects.json"
+// It ensures that the base directory exists.
+func (s *displayTrackingReportGenerator) dailyFilePath(dateStr, baseDir string) string {
+	// Create the directory if it does not exist.
+	_ = os.MkdirAll(baseDir, 0755)
+	return filepath.Join(baseDir, fmt.Sprintf("%s-tracked-objects.json", dateStr))
 }
 
 // Name returns the resource name
@@ -264,9 +382,7 @@ func (s *displayTrackingReportGenerator) Reconfigure(ctx context.Context, deps r
 	s.cancelCtx = cancelCtx
 	s.cancelFunc = cancelFunc
 
-	// optionally reset date, path if you want to treat reconfigure as a fresh start
-	// s.currentDate = time.Now().Format("2006-01-02")
-	// s.currentPath = s.dailyFilePath(s.currentDate)
+	s.tracker, err = vision.FromDependencies(deps, s.cfg.TrackerName)
 
 	go s.dataCollectionLoop()
 	return nil
@@ -277,7 +393,7 @@ func (s *displayTrackingReportGenerator) NewClientFromConn(ctx context.Context, 
 	panic("not implemented")
 }
 
-// Readings reads today's file, parses each line as a PizzaInfo, and returns a map keyed by ID
+// Readings reads today's file, parses each line as a TrackedObjectInfo, and returns a map keyed by ID
 func (s *displayTrackingReportGenerator) Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
 	// Lock around file access to avoid race conditions with the dataCollectionLoop
 	s.fileLock.Lock()
@@ -295,29 +411,16 @@ func (s *displayTrackingReportGenerator) Readings(ctx context.Context, extra map
 	}
 	defer f.Close()
 
-	// We'll accumulate everything in a map from ID -> detection info
-	out := make(map[string]interface{})
+	// We expect the file to be in the desired map format
+	var fileData map[string]interface{}
 
-	dec := json.NewDecoder(f)
-	for {
-		var pi PizzaInfo
-		if err := dec.Decode(&pi); err != nil {
-			if errors.Is(err, io.EOF) {
-				// End of file
-				break
-			}
-			// If there's some decoding error, log or return it
-			return nil, err
-		}
-
-		// We assume pi.ID is a unique identifier
-		out[pi.ID] = map[string]interface{}{
-			"first_seen": pi.FirstSeen,
-			"last_seen":  pi.LastSeen,
-		}
+	// Read and unmarshal the entire file content into the map
+	decoder := json.NewDecoder(f)
+	if err := decoder.Decode(&fileData); err != nil {
+		return nil, fmt.Errorf("failed to decode file: %w", err)
 	}
 
-	return out, nil
+	return fileData, nil
 }
 
 // DoCommand is unimplemented
