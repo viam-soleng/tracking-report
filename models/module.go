@@ -223,6 +223,12 @@ func (s *displayTrackingReportGenerator) getDetections() ([]TrackedObjectInfo, e
 
 // writeDetectionsToFile opens the current daily file and appends JSON lines
 func (s *displayTrackingReportGenerator) writeDetectionsToFile(detections []TrackedObjectInfo) error {
+	// Ensure the directory for s.currentPath exists.
+	dir := filepath.Dir(s.currentPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directories for %s: %w", s.currentPath, err)
+	}
+
 	// Check if the file exists and read its contents if it does.
 	var existingDetections map[string][]TrackedObjectInfo
 	if _, err := os.Stat(s.currentPath); err == nil {
