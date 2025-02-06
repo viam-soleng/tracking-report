@@ -106,7 +106,7 @@ func newDisplayTrackingReportGenerator(ctx context.Context, deps resource.Depend
 	// Use defaults if not provided in the config.
 	tempDataDir := conf.TemporaryDataDir
 	if tempDataDir == "" {
-		tempDataDir = "/data/json_daily_report"
+		tempDataDir = "~/data/json_daily_report"
 	}
 	dataSyncDir := conf.DataSyncDir
 	if dataSyncDir == "" {
