@@ -192,7 +192,6 @@ func (s *displayTrackingReportGenerator) dataCollectionLoop() {
 
 		case <-ticker.C:
 			// 1) Check if it's a new day
-			s.logger.Info()
 			nowDay := time.Now().Format("2006-01-02")
 			if nowDay != s.currentDate {
 				s.logger.Info("Day changed; rotating file.")
