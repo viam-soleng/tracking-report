@@ -107,15 +107,47 @@ func newDisplayTrackingReportGenerator(ctx context.Context, deps resource.Depend
 
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
-	// Use defaults if not provided in the config.
 	tempDataDir := conf.TemporaryDataDir
 	if tempDataDir == "" {
-		tempDataDir = "~/data/json_daily_report"
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			panic(fmt.Errorf("failed to get user home directory: %w", err))
+		}
+		tempDataDir = filepath.Join(homeDir, "data", "json_daily_report")
+	} else {
+		if strings.HasPrefix(tempDataDir, "~") {
+			homeDir, err := os.UserHomeDir()
+			if err != nil {
+				panic(fmt.Errorf("failed to get user home directory: %w", err))
+			}
+			tempDataDir = filepath.Join(homeDir, strings.TrimPrefix(tempDataDir, "~"))
+		}
 	}
+
+	// **Log the final path** where we plan to write files
+	logger.Infof("Using Temporary Data Directory: %s", tempDataDir)
+
+	// You can also confirm the current working directory:
+	pwd, err := os.Getwd()
+	if err == nil {
+		logger.Infof("Current working directory is: %s", pwd)
+	} else {
+		logger.Errorw("Failed to get working directory", "error", err)
+	}
+
 	dataSyncDir := conf.DataSyncDir
 	if dataSyncDir == "" {
 		dataSyncDir = "/root/.viam/capture"
+	} else if strings.HasPrefix(dataSyncDir, "~") {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			panic(fmt.Errorf("failed to get user home directory: %w", err))
+		}
+		dataSyncDir = filepath.Join(homeDir, strings.TrimPrefix(dataSyncDir, "~"))
 	}
+
+	logger.Infof("Using Data Sync Directory: %s", dataSyncDir)
+
 	interval := conf.Interval
 	if interval == 0 {
 		interval = 60
@@ -160,6 +192,7 @@ func (s *displayTrackingReportGenerator) dataCollectionLoop() {
 
 		case <-ticker.C:
 			// 1) Check if it's a new day
+			s.logger.Info()
 			nowDay := time.Now().Format("2006-01-02")
 			if nowDay != s.currentDate {
 				s.logger.Info("Day changed; rotating file.")
@@ -202,7 +235,7 @@ func (s *displayTrackingReportGenerator) dataCollectionLoop() {
 func (s *displayTrackingReportGenerator) getDetections() ([]TrackedObjectInfo, error) {
 	// Call the vision service to get raw detections as strings.
 	// We assume that each string is formatted like "oven_0_20250204_150602".
-	s.logger.Info("Getting detections from camera.")
+	// s.logger.Debugf("Getting detections from camera.")
 	// s.logger.Info(fmt.Sprintf("Tracker: %v", s.tracker))
 	// s.logger.Info(fmt.Sprintf("Camera Name: %v", s.cfg.CameraName))
 	rawDetections, err := s.tracker.DetectionsFromCamera(s.cancelCtx, s.cfg.CameraName, map[string]interface{}{})
@@ -212,11 +245,9 @@ func (s *displayTrackingReportGenerator) getDetections() ([]TrackedObjectInfo, e
 
 	detections := make([]TrackedObjectInfo, 0, len(rawDetections))
 
-	s.logger.Info("Raw Detections: ", rawDetections)
+	// s.logger.Debugf("Raw Detections: ", rawDetections)
 	for _, detection := range rawDetections {
-		s.logger.Info("Detection: ", detection)
 		class_name := detection.Label()
-		s.logger.Info("Class Name: ", class_name)
 		parsed, err := newTrackedObjectInfoFromDetection(class_name)
 		if err != nil {
 			s.logger.Errorw("failed to parse detection", "detection", class_name, "error", err)
@@ -294,8 +325,7 @@ func (s *displayTrackingReportGenerator) writeDetectionsToFile(detections []Trac
 	if err := os.WriteFile(s.currentPath, out, 0600); err != nil {
 		return err
 	}
-
-	s.logger.Infof("Updated detections in %s", s.currentPath)
+	// s.logger.Debugf("Updated detections in %s", s.currentPath)
 	return nil
 }
 
@@ -306,7 +336,6 @@ func (s *displayTrackingReportGenerator) writeDetectionsToFile(detections []Trac
 func newTrackedObjectInfoFromDetection(detectionStr string) (TrackedObjectInfo, error) {
 	// Split the detection string
 	parts := strings.Split(detectionStr, "_")
-	print(detectionStr, parts)
 	if len(parts) > 5 {
 		return TrackedObjectInfo{}, fmt.Errorf("unexpected detection format: %s", detectionStr)
 	}
@@ -550,9 +579,29 @@ func (s *displayTrackingReportGenerator) Readings(ctx context.Context, extra map
 	return fileData, nil
 }
 
-// DoCommand is unimplemented
 func (s *displayTrackingReportGenerator) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
-	return nil, errUnimplemented
+	// Example expected input: {"action": "rotate"}
+	action, ok := cmd["action"].(string)
+	if !ok {
+		return nil, fmt.Errorf("missing or invalid 'action' in DoCommand input")
+	}
+
+	switch action {
+	case "rotate":
+		// Lock around file I/O
+		s.fileLock.Lock()
+		defer s.fileLock.Unlock()
+
+		if err := s.rotateFile(); err != nil {
+			return nil, fmt.Errorf("failed to rotate file: %w", err)
+		}
+		return map[string]interface{}{
+			"status": "file rotated successfully",
+		}, nil
+
+	default:
+		return nil, fmt.Errorf("unknown action '%s'", action)
+	}
 }
 
 // Close stops the background loop
