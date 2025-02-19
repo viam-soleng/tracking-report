@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"go.viam.com/rdk/components/sensor"
+	"go.viam.com/rdk/data"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/services/vision"
@@ -180,7 +181,7 @@ func newDisplayTrackingReportGenerator(ctx context.Context, deps resource.Depend
 
 // dataCollectionLoop runs periodically to collect detections & write them to a daily file.
 func (s *displayTrackingReportGenerator) dataCollectionLoop() {
-	ticker := time.NewTicker(time.Duration(s.interval) * time.Second) // collect every 60 seconds
+	ticker := time.NewTicker(time.Duration(s.interval) * time.Second) // collect every s.interval seconds
 	defer ticker.Stop()
 
 	s.logger.Info("Starting data collection loop.")
@@ -191,31 +192,13 @@ func (s *displayTrackingReportGenerator) dataCollectionLoop() {
 			return
 
 		case <-ticker.C:
-			// 1) Check if it's a new day
-			nowDay := time.Now().Format("2006-01-02")
-			if nowDay != s.currentDate {
-				s.logger.Info("Day changed; rotating file.")
-				// Rotate old file
-				s.fileLock.Lock()
-				err := s.rotateFile()
-				s.fileLock.Unlock()
-
-				if err != nil {
-					s.logger.Errorw("failed to rotate file", "error", err)
-				}
-
-				// Update to new day
-				s.currentDate = nowDay
-				s.currentPath = s.dailyFilePath(s.currentDate, s.tempDataDir)
-			}
-
-			// 2) Get new detections (this is a placeholder function below)
+			// 1) Get new detections.
 			detections, err := s.getDetections()
 			if err != nil {
 				s.logger.Errorw("failed to get detections", "error", err)
 				continue
 			}
-			// 3) If there are detections, lock the file, dump them in there
+			// 2) If there are detections, lock the file, and write them.
 			if len(detections) > 0 {
 				s.fileLock.Lock()
 				err := s.writeDetectionsToFile(detections)
@@ -225,7 +208,6 @@ func (s *displayTrackingReportGenerator) dataCollectionLoop() {
 					s.logger.Errorw("failed to write detections to file", "error", err)
 				}
 			}
-
 		}
 	}
 }
@@ -550,29 +532,52 @@ func (s *displayTrackingReportGenerator) NewClientFromConn(ctx context.Context, 
 
 // Readings reads today's file, parses each line as a TrackedObjectInfo, and returns a map keyed by ID
 func (s *displayTrackingReportGenerator) Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
-	// Lock around file access to avoid race conditions with the dataCollectionLoop
 	s.fileLock.Lock()
 	defer s.fileLock.Unlock()
 
-	// Open the current day's file
+	if extra[data.FromDMString] == true {
+		nowDay := time.Now().Format("2006-01-02")
+		if nowDay != s.currentDate {
+			s.logger.Info("Data manager called Readings on a new day; rotating the file so it can capture yesterday's data.")
+
+			oldFileData, err := s.readCurrentFile()
+			if err != nil {
+				if os.IsNotExist(err) {
+					s.logger.Warnf("File %s does not exist; returning empty data", s.currentPath)
+					return map[string]interface{}{}, nil
+				}
+				return nil, fmt.Errorf("failed to read old file data: %w", err)
+			}
+
+			if err := s.rotateFile(); err != nil {
+				return nil, fmt.Errorf("failed to rotate file: %w", err)
+			}
+
+			s.currentDate = nowDay
+			s.currentPath = s.dailyFilePath(s.currentDate, s.tempDataDir)
+			return oldFileData, nil
+		}
+		// return nil and an error if it's not a new day.
+		return nil, data.ErrNoCaptureToStore
+	}
+
+	// For non-data manager calls, you may decide whether to return readings or not.
+	return s.readCurrentFile()
+}
+
+// readCurrentFile is a small helper that opens the current JSON file and unmarshals it
+func (s *displayTrackingReportGenerator) readCurrentFile() (map[string]interface{}, error) {
 	f, err := os.Open(s.currentPath)
 	if err != nil {
-		// If file doesn't exist, return empty
-		if os.IsNotExist(err) {
-			s.logger.Warnf("File %s does not exist; returning empty data", s.currentPath)
-			return map[string]interface{}{}, nil
-		}
+		// If file doesn’t exist, return an error so caller can handle it
 		return nil, err
 	}
 	defer f.Close()
 
-	// We expect the file to be in the desired map format
 	var fileData map[string]interface{}
-
-	// Read and unmarshal the entire file content into the map
 	decoder := json.NewDecoder(f)
 	if err := decoder.Decode(&fileData); err != nil {
-		return nil, fmt.Errorf("failed to decode file: %w", err)
+		return nil, fmt.Errorf("failed to decode JSON file: %w", err)
 	}
 
 	return fileData, nil

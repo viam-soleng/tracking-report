@@ -3,7 +3,7 @@ module display-tracking
 go 1.23
 
 require (
-	go.viam.com/rdk v0.62.0
+	go.viam.com/rdk v0.63.0
 	go.viam.com/utils v0.1.130
 )
 
