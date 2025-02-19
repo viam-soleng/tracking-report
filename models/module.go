@@ -2,6 +2,7 @@ package models
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -62,6 +63,9 @@ type TrackedObjectInfo struct {
 	FirstSeenUnix     int64  `json:"first_seen_unix"`
 	LastSeenDateTime  string `json:"last_seen_date_time"`
 	LastSeenUnix      int64  `json:"last_seen_unix"`
+	IsFull            bool   `json:"is_full"`
+	LastFull          string `json:"last_full_date_time"`
+	LastFullUnix      int64  `json:"last_seen_unix"`
 	Age               int64  `json:"age,omitempty"`
 	ID                string `json:"id,omitempty`
 	Label             string `json:"label,omitempty`
@@ -207,8 +211,12 @@ func (s *displayTrackingReportGenerator) getDetections() ([]TrackedObjectInfo, e
 	}
 
 	detections := make([]TrackedObjectInfo, 0, len(rawDetections))
+
+	s.logger.Info("Raw Detections: ", rawDetections)
 	for _, detection := range rawDetections {
+		s.logger.Info("Detection: ", detection)
 		class_name := detection.Label()
+		s.logger.Info("Class Name: ", class_name)
 		parsed, err := newTrackedObjectInfoFromDetection(class_name)
 		if err != nil {
 			s.logger.Errorw("failed to parse detection", "detection", class_name, "error", err)
@@ -251,10 +259,17 @@ func (s *displayTrackingReportGenerator) writeDetectionsToFile(detections []Trac
 			found := false
 			for i, existing := range classDetections {
 				if existing.ID == newDetection.ID {
-					// Update the LastSeen field and Age
+					// Update the last seen values
 					existingDetections[classLabel][i].LastSeenUnix = newDetection.LastSeenUnix
 					existingDetections[classLabel][i].LastSeenDateTime = newDetection.LastSeenDateTime
 					existingDetections[classLabel][i].Age = newDetection.LastSeenUnix - existingDetections[classLabel][i].FirstSeenUnix
+
+					// If the new detection is "full", update the last full seen fields.
+					if newDetection.IsFull {
+						existingDetections[classLabel][i].IsFull = true
+						existingDetections[classLabel][i].LastFullUnix = newDetection.LastSeenUnix
+						existingDetections[classLabel][i].LastFull = newDetection.LastSeenDateTime
+					}
 					found = true
 					break
 				}
@@ -291,7 +306,8 @@ func (s *displayTrackingReportGenerator) writeDetectionsToFile(detections []Trac
 func newTrackedObjectInfoFromDetection(detectionStr string) (TrackedObjectInfo, error) {
 	// Split the detection string
 	parts := strings.Split(detectionStr, "_")
-	if len(parts) != 4 {
+	print(detectionStr, parts)
+	if len(parts) > 5 {
 		return TrackedObjectInfo{}, fmt.Errorf("unexpected detection format: %s", detectionStr)
 	}
 
@@ -300,6 +316,21 @@ func newTrackedObjectInfoFromDetection(detectionStr string) (TrackedObjectInfo, 
 	detectionID := parts[1]
 	datePart := parts[2] // e.g., "20250204"
 	timePart := parts[3] // e.g., "193808" (6 digits)
+
+	// Set default status to partial
+	isFull := true
+	if len(parts) == 5 {
+		// The fifth part must be either "full" or "partial"
+		status := parts[4]
+		switch status {
+		case "full":
+			isFull = true
+		case "partial":
+			isFull = false
+		default:
+			return TrackedObjectInfo{}, fmt.Errorf("unexpected status '%s' in detection: %s", status, detectionStr)
+		}
+	}
 
 	// Combine date and time to form the complete timestamp
 	dateTimeStr := datePart + timePart // e.g., "202502041938081"
@@ -310,19 +341,19 @@ func newTrackedObjectInfoFromDetection(detectionStr string) (TrackedObjectInfo, 
 		return TrackedObjectInfo{}, fmt.Errorf("failed to parse datetime %s: %w", dateTimeStr, err)
 	}
 
-	// Format FirstSeen in Unix timestamp (seconds since epoch)
 	firstSeenUnix := t.Unix()
-
-	// Get the current time for LastSeen
 	lastSeenUnix := time.Now().Unix()
-
-	// Calculate the Age (difference between FirstSeen and LastSeen in seconds)
 	age := lastSeenUnix - firstSeenUnix
+	firstSeenDateTime := t.Format("2006-01-02 15:04:05 -0700 MST")
+	lastSeenDateTime := time.Now().Format("2006-01-02 15:04:05 -0700 MST")
 
-	// Convert FirstSeen and LastSeen to human-readable format
-	firstSeenDateTime := t.Format("2006-01-02 15:04:05 -0700 MST") // YYYY-MM-DD HH:MM:SS ±HHMM TZ
-	fmt.Println("Date time:", firstSeenDateTime)
-	lastSeenDateTime := time.Now().Format("2006-01-02 15:04:05 -0700 MST") // Current time in human-readable format with timezone
+	// If the detection is "full", initialize the LastFull fields to the same timestamp.
+	lastFullUnix := int64(0)
+	lastFullDateTime := ""
+	if isFull {
+		lastFullUnix = lastSeenUnix
+		lastFullDateTime = lastSeenDateTime
+	}
 
 	// Return the tracked object with all parsed values
 	return TrackedObjectInfo{
@@ -333,10 +364,88 @@ func newTrackedObjectInfoFromDetection(detectionStr string) (TrackedObjectInfo, 
 		Age:               age,
 		ID:                detectionID,
 		Label:             detectionClass,
+		IsFull:            isFull,
+		LastFullUnix:      lastFullUnix,
+		LastFull:          lastFullDateTime,
 	}, nil
 }
 
-// rotateFile moves the current daily file to s.dataSyncDir, creating the directory if needed.
+// createCSVFromJSON reads the given JSON file (in the shape map[string][]TrackedObjectInfo),
+// converts all slices to CSV rows, and writes them to csvPath.
+func createCSVFromJSON(jsonPath, csvPath string) error {
+	// 1. Read the JSON file
+	data, err := os.ReadFile(jsonPath)
+	if err != nil {
+		return fmt.Errorf("failed to read JSON file %s: %w", jsonPath, err)
+	}
+
+	// 2. Parse into map[label] => []TrackedObjectInfo
+	var allDetections map[string][]TrackedObjectInfo
+	if err := json.Unmarshal(data, &allDetections); err != nil {
+		return fmt.Errorf("failed to unmarshal JSON for %s: %w", jsonPath, err)
+	}
+
+	// 3. Flatten into a single list for CSV
+	var rows []TrackedObjectInfo
+	for label, detSlice := range allDetections {
+		for _, det := range detSlice {
+			// Make sure the struct’s Label is consistent with the map key
+			// (sometimes they might mismatch, but presumably you’re storing them consistently).
+			det.Label = label
+			rows = append(rows, det)
+		}
+	}
+
+	// 4. Create or overwrite the CSV file
+	f, err := os.Create(csvPath)
+	if err != nil {
+		return fmt.Errorf("failed to create CSV file %s: %w", csvPath, err)
+	}
+	defer f.Close()
+
+	// 5. Write header and rows
+	writer := csv.NewWriter(f)
+	defer writer.Flush()
+
+	// CSV header
+	headers := []string{
+		"FirstSeenDateTime",
+		"FirstSeenUnix",
+		"LastSeenDateTime",
+		"LastSeenUnix",
+		"Age",
+		"ID",
+		"Label",
+		"IsFull",
+		"LastFull",
+		"LastFullUnix",
+	}
+	if err := writer.Write(headers); err != nil {
+		return fmt.Errorf("failed to write CSV header: %w", err)
+	}
+
+	// Write each row
+	for _, det := range rows {
+		record := []string{
+			det.FirstSeenDateTime,
+			fmt.Sprintf("%d", det.FirstSeenUnix),
+			det.LastSeenDateTime,
+			fmt.Sprintf("%d", det.LastSeenUnix),
+			fmt.Sprintf("%d", det.Age),
+			det.ID,
+			det.Label,
+			fmt.Sprintf("%t", det.IsFull),
+			det.LastFull,
+			fmt.Sprintf("%d", det.LastFullUnix),
+		}
+		if err := writer.Write(record); err != nil {
+			return fmt.Errorf("failed to write CSV row: %w", err)
+		}
+	}
+
+	return nil
+}
+
 func (s *displayTrackingReportGenerator) rotateFile() error {
 	if _, err := os.Stat(s.currentPath); os.IsNotExist(err) {
 		// If file doesn't exist, nothing to rotate
@@ -349,13 +458,27 @@ func (s *displayTrackingReportGenerator) rotateFile() error {
 	}
 
 	baseName := filepath.Base(s.currentPath)
+	// e.g. "2025-02-03-tracked-objects.json"
 	newPath := filepath.Join(s.dataSyncDir, baseName)
 
+	// Move (rename) the JSON file to dataSyncDir
 	if err := os.Rename(s.currentPath, newPath); err != nil {
 		return fmt.Errorf("failed to rename file from %s to %s: %w", s.currentPath, newPath, err)
 	}
-
 	s.logger.Infof("Rotated file from %s to %s", s.currentPath, newPath)
+
+	// Build the CSV path: same directory, same base, but .csv
+	// E.g.  baseName = "2025-02-03-tracked-objects.json"
+	//       csvBaseName = "2025-02-03-tracked-objects.csv"
+	csvBaseName := strings.TrimSuffix(baseName, filepath.Ext(baseName)) + ".csv"
+	csvPath := filepath.Join(s.dataSyncDir, csvBaseName)
+
+	// Create CSV from the just-rotated JSON file
+	if err := createCSVFromJSON(newPath, csvPath); err != nil {
+		return fmt.Errorf("failed to create CSV from JSON %s: %w", newPath, err)
+	}
+	s.logger.Infof("Created CSV file at %s", csvPath)
+
 	return nil
 }
 
